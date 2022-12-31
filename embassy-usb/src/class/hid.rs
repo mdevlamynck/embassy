@@ -11,10 +11,6 @@ use crate::control::{ControlHandler, InResponse, OutResponse, Request, RequestTy
 use crate::driver::{Driver, Endpoint, EndpointError, EndpointIn, EndpointOut};
 use crate::Builder;
 
-const USB_CLASS_HID: u8 = 0x03;
-const USB_SUBCLASS_NONE: u8 = 0x00;
-const USB_PROTOCOL_NONE: u8 = 0x00;
-
 // HID
 const HID_DESC_DESCTYPE_HID: u8 = 0x21;
 const HID_DESC_DESCTYPE_HID_REPORT: u8 = 0x22;
@@ -44,6 +40,10 @@ pub struct Config<'d> {
 
     /// Max packet size for both the IN and OUT endpoints.
     pub max_packet_size: u16,
+
+    pub interface_class: u8,
+    pub interface_sub_class: u8,
+    pub interface_protocol: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +61,52 @@ impl ReportId {
             2 => Ok(ReportId::Out(value as u8)),
             3 => Ok(ReportId::Feature(value as u8)),
             _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Protocol {
+    Boot,
+    Report,
+}
+
+impl From<bool> for Protocol {
+    fn from(value: bool) -> Self {
+        match value {
+            false => Protocol::Boot,
+            true => Protocol::Report,
+        }
+    }
+}
+
+impl TryFrom<u16> for Protocol {
+    type Error = ();
+
+    fn try_from(value: u16) -> Result<Self, ()> {
+        match value {
+            0 => Ok(Protocol::Boot),
+            1 => Ok(Protocol::Report),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<Protocol> for u8 {
+    fn from(protocol: Protocol) -> u8 {
+        match protocol {
+            Protocol::Boot => 0,
+            Protocol::Report => 1,
+        }
+    }
+}
+
+impl From<Protocol> for bool {
+    fn from(protocol: Protocol) -> bool {
+        match protocol {
+            Protocol::Boot => false,
+            Protocol::Report => true,
         }
     }
 }
@@ -98,10 +144,10 @@ fn build<'d, D: Driver<'d>>(
 
     let len = config.report_descriptor.len();
 
-    let mut func = builder.function(USB_CLASS_HID, USB_SUBCLASS_NONE, USB_PROTOCOL_NONE);
+    let mut func = builder.function(config.interface_class, config.interface_sub_class, config.interface_protocol);
     let mut iface = func.interface();
     iface.handler(control);
-    let mut alt = iface.alt_setting(USB_CLASS_HID, USB_SUBCLASS_NONE, USB_PROTOCOL_NONE);
+    let mut alt = iface.alt_setting(config.interface_class, config.interface_sub_class, config.interface_protocol);
 
     // HID descriptor
     alt.descriptor(
@@ -376,6 +422,15 @@ pub trait RequestHandler {
     fn set_idle_ms(&self, id: Option<ReportId>, duration_ms: u32) {
         let _ = (id, duration_ms);
     }
+
+    fn get_protocol(&self) -> Protocol {
+        Protocol::Report
+    }
+
+    fn set_protocol(&self, protocol: Protocol) -> OutResponse {
+        let _ = protocol;
+        OutResponse::Rejected
+    }
 }
 
 struct Control<'d> {
@@ -448,14 +503,18 @@ impl<'d> ControlHandler for Control<'d> {
                     (Ok(id), Some(handler)) => handler.set_report(id, data),
                     _ => OutResponse::Rejected,
                 },
-                HID_REQ_SET_PROTOCOL => {
-                    if req.value == 1 {
-                        OutResponse::Accepted
-                    } else {
+                HID_REQ_SET_PROTOCOL => match (Protocol::try_from(req.value), self.request_handler) {
+                    (Ok(protocol), Some(handler)) => handler.set_protocol(protocol),
+                    (Ok(Protocol::Report), _) => OutResponse::Accepted,
+                    (Ok(Protocol::Boot), _) => {
                         warn!("HID Boot Protocol is unsupported.");
                         OutResponse::Rejected // UNSUPPORTED: Boot Protocol
+                    },
+                    _ => {
+                        warn!("Invalid Protocol");
+                        OutResponse::Rejected
                     }
-                }
+                },
                 _ => OutResponse::Rejected,
             }
         } else {
@@ -494,8 +553,10 @@ impl<'d> ControlHandler for Control<'d> {
                 }
             }
             HID_REQ_GET_PROTOCOL => {
-                // UNSUPPORTED: Boot Protocol
-                buf[0] = 1;
+                buf[0] = match self.request_handler {
+                    Some(handler) => handler.get_protocol().into(),
+                    _ => Protocol::Report.into() // UNSUPPORTED: Boot Protocol
+                };
                 InResponse::Accepted(&buf[0..1])
             }
             _ => InResponse::Rejected,
